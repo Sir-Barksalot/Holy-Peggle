@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Peggly — mini Peggle clone</title>
+<style>
+  :root{
+    --bg:#071021; --card:#0e1620; --accent:#6be5ff; --hot:#ffd166;
+    --peg1:#ff6b6b; --peg2:#6bffb8; --peg3:#ffd166; --text:#e6eef6;
+  }
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#03101a,#071021);color:var(--text);font-family:Inter,system-ui,Arial}
+  .wrap{max-width:980px;margin:14px auto;padding:12px}
+  header{display:flex;align-items:center;gap:12px}
+  h1{margin:0;font-size:26px}
+  .tag{color:#9fb0c0;font-size:13px}
+  #ui{display:flex;gap:12px;align-items:center;margin-top:8px}
+  .panel{background:rgba(255,255,255,0.03);padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.03)}
+  canvas{display:block;margin:18px auto;border-radius:12px;background:linear-gradient(180deg,#06202a,#03202a);box-shadow:0 6px 30px rgba(0,0,0,0.5)}
+  .small{font-size:13px;color:#9fb0c0}
+  button{background:var(--accent);border:0;padding:8px 12px;border-radius:8px;color:#022;font-weight:700;cursor:pointer}
+  footer{margin-top:8px;color:#8fa2b2;font-size:12px}
+  .hint{color:#9fb0c0;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Peggly — mini Peggle</h1>
+    <div class="tag">A tiny Peggle-like — aim, shoot, bounce, clear the orange pegs. 🎯</div>
+  </header>
+
+  <div id="ui">
+    <div class="panel">
+      <div>Score: <span id="score">0</span> • Balls: <span id="balls">5</span> • Level: <span id="level">1</span></div>
+      <div class="small hint">Aim with mouse. Click or press <strong>Space</strong> to shoot.</div>
+    </div>
+    <button id="restart">Restart</button>
+    <div style="flex:1"></div>
+    <div class="panel small">Pro tip: hitting a blue star gives bonus points. Peggle balls go brrr.</div>
+  </div>
+
+  <canvas id="canvas" width="820" height="600"></canvas>
+
+  <footer>
+    Built for fun. Don’t break school stuff. Want power-ups, levels, or music? Say the word.
+  </footer>
+</div>
+
+<script>
+/* Peggly — single-file mini Peggle clone
+   Controls:
+     - Move mouse to aim
+     - Click or press Space to shoot (consumes a ball)
+     - R to restart
+*/
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d', { alpha: true });
+  const W = canvas.width, H = canvas.height;
+  const scoreEl = document.getElementById('score');
+  const ballsEl = document.getElementById('balls');
+  const levelEl = document.getElementById('level');
+  const restartBtn = document.getElementById('restart');
+
+  // Game state
+  let score = 0, balls = 5, level = 1;
+  let pegs = [], particles = [], ball = null, aiming = true;
+  let mouse = { x: W/2, y: H - 60 }, lastTime = 0, gameOver = false;
+
+  // Constants
+  const gravity = 0.35;
+  const friction = 0.998;
+  const pegRadius = 12;
+  const starRadius = 9;
+  const ballRadius = 8;
+  const maxPegs = 36;
+
+  // Utilities
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function dist(a,b,c,d){ const dx=a-c, dy=b-d; return Math.sqrt(dx*dx+dy*dy); }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+  // Sounds (simple WebAudio click boink)
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function blip(freq=350, time=0.05, vol=0.08){
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + time);
+  }
+
+  // Peg / star creation
+  function makeLevel(l=1){
+    pegs = [];
+    particles = [];
+    const rows = 6 + Math.min(3, Math.floor(l/2));
+    const cols = 10;
+    const left = 80, top = 70;
+    const spacingX = (W - left*2) / (cols-1);
+    const spacingY = 44;
+
+    // pattern: random orange pegs + some blue stars
+    let total = 0;
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        const x = left + c*spacingX + (r%2? spacingX/2:0);
+        const y = top + r*spacingY + (c%3===0? rand(-6,6):0);
+        const isStar = Math.random() < 0.08 + Math.min(0.12, l*0.01); // blue star chance increases slightly with level
+        const color = isStar ? '#6be5ff' : (Math.random() < 0.15 ? '#ffd166' : '#ff6b6b');
+        pegs.push({ x,y, r: isStar?starRadius:pegRadius, color, hit:false, star:isStar });
+        total++;
+        if(total >= maxPegs) break;
+      }
+      if(total >= maxPegs) break;
+    }
+    // Add a central orange cluster for a satisfying target
+    for(let i=0;i<6;i++){
+      pegs.push({ x: W/2 + rand(-80,80), y: top - 10 + i*18, r: pegRadius, color:'#ff6b6b', hit:false, star:false });
+    }
+  }
+
+  // Particle system for visuals
+  function spawnParticles(x,y,color,count=12){
+    for(let i=0;i<count;i++){
+      particles.push({
+        x,y,
+        vx: rand(-3,3),
+        vy: rand(-6,-1),
+        life: rand(30,70),
+        col: color
+      });
+    }
+  }
+
+  // Ball creation & physics
+  function newBall(angle, power){
+    const speed = clamp(power, 6, 28);
+    const vx = Math.cos(angle) * speed;
+    const vy = Math.sin(angle) * speed;
+    ball = { x: W/2, y: H - 36, vx, vy, r: ballRadius, alive: true, stuckTimer:0 };
+    blip(360 + Math.random()*200, 0.03, 0.06);
+  }
+
+  function update(dt){
+    // particles
+    for(let i=particles.length-1;i>=0;i--){
+      const p = particles[i];
+      p.vy += 0.18;
+      p.x += p.vx; p.y += p.vy; p.life--;
+      if(p.life<=0) particles.splice(i,1);
+    }
+
+    if(!ball) return;
+
+    // integrate
+    ball.vy += gravity;
+    ball.vx *= friction;
+    ball.vy *= 0.999;
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // walls
+    if(ball.x - ball.r < 6){ ball.x = 6 + ball.r; ball.vx *= -0.9; blip(420,0.02,0.03); }
+    if(ball.x + ball.r > W-6){ ball.x = W-6 - ball.r; ball.vx *= -0.9; blip(420,0.02,0.03); }
+    if(ball.y - ball.r < 6){ ball.y = 6 + ball.r; ball.vy *= -0.9; blip(420,0.02,0.03); }
+
+    // floor -> lose ball
+    if(ball.y - ball.r > H - 6){
+      ball.alive = false;
+      balls--;
+      ballsEl.textContent = balls;
+      blip(160,0.12,0.12);
+      spawnParticles(ball.x, H-12, '#ffffff', 18);
+      ball = null;
+      aiming = true;
+      if(balls <= 0){
+        gameOver = true;
+        setTimeout(()=>{ alert('No balls left — game over! Score: ' + score); }, 150);
+      }
+      return;
+    }
+
+    // peg collisions
+    for(let i=0;i<pegs.length;i++){
+      const p = pegs[i];
+      if(p.hit) continue;
+      const d = dist(ball.x, ball.y, p.x, p.y);
+      const minD = (ball.r + p.r);
+      if(d < minD){
+        // basic elastic collision: reflect velocity along normal
+        const nx = (ball.x - p.x) / d;
+        const ny = (ball.y - p.y) / d;
+        // push out
+        const overlap = minD - d;
+        ball.x += nx * overlap;
+        ball.y += ny * overlap;
+        // reflect velocity
+        const vDotN = ball.vx * nx + ball.vy * ny;
+        ball.vx = ball.vx - 2 * vDotN * nx;
+        ball.vy = ball.vy - 2 * vDotN * ny;
+        ball.vx *= 0.98; ball.vy *= 0.98;
+        // add speed
+        const speedBoost = 1.05;
+        ball.vx *= speedBoost; ball.vy *= speedBoost;
+
+        // mark peg hit
+        p.hit = true;
+        spawnParticles(p.x, p.y, p.color, p.star?24:12);
+        blip(p.star?880:620, 0.06, p.star?0.14:0.08);
+
+        // scoring
+        let gained = p.star ? 250 + Math.floor(Math.random()*120) : 100;
+        if(p.color === '#ffd166') gained += 25; // gold pegs small bonus
+        score += gained;
+        scoreEl.textContent = score;
+
+        // star extra: give a little ball boost
+        if(p.star){
+          // small random velocity burst
+          ball.vx += rand(-3,3);
+          ball.vy -= 4;
+        }
+
+        // quick combo: remove peg visually (we keep in array but flagged)
+        break;
+      }
+    }
+
+    // stuck detection — if ball slow and near bottom, kill it to avoid infinite loops
+    if(Math.abs(ball.vx) < 0.03 && Math.abs(ball.vy) < 0.03) ball.stuckTimer++;
+    else ball.stuckTimer = 0;
+    if(ball.stuckTimer > 180){
+      ball.alive = false;
+      balls--;
+      ball = null;
+      aiming = true;
+    }
+
+    // level completion check
+    const remaining = pegs.filter(p => !p.hit && !p.star).length;
+    const remainingStars = pegs.filter(p => !p.hit && p.star).length;
+    if(remaining === 0){
+      // level cleared
+      score += 500 * level;
+      level++;
+      levelEl.textContent = level;
+      balls = Math.min(9, balls + 2); // reward extra balls
+      ballsEl.textContent = balls;
+      // make a confetti burst
+      for(let i=0;i<200;i++){
+        particles.push({
+          x: rand(W*0.2, W*0.8), y: H*0.4 + rand(-40,40),
+          vx: rand(-4,4), vy: rand(-6,6), life: rand(40,120),
+          col: ['#ff6b6b','#6bffb8','#ffd166','#6be5ff'][Math.floor(Math.random()*4)]
+        });
+      }
+      setTimeout(()=> makeLevel(level), 400);
+    }
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // backdrop glow
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'rgba(255,255,255,0.02)');
+    g.addColorStop(1,'rgba(0,0,0,0.12)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // draw pegs
+    for(const p of pegs){
+      if(p.hit) continue;
+      // outer glow
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      ctx.arc(p.x, p.y, p.r + 8, 0, Math.PI*2);
+      ctx.fill();
+      ctx.closePath();
+      // peg
+      ctx.beginPath();
+      ctx.fillStyle = p.color;
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.closePath();
+      // inner shine
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.arc(p.x - p.r*0.35, p.y - p.r*0.35, Math.max(1, p.r*0.45), 0, Math.PI*2);
+      ctx.fill();
+      ctx.closePath();
+    }
+
+    // particles
+    for(const p of particles){
+      ctx.beginPath();
+      ctx.fillStyle = p.col;
+      ctx.globalAlpha = clamp(p.life / 80, 0, 1);
+      ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // cannon / launcher
+    const baseX = W/2, baseY = H - 36;
+    ctx.beginPath();
+    ctx.fillStyle = '#0f1720';
+    ctx.roundRect = ctx.roundRect || function(x,y,w,h,r){ ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); };
+    ctx.fillStyle = '#08161c';
+    ctx.fillRect(baseX-56, baseY-12, 112, 22);
+    // aim line and ball preview
+    if(aiming){
+      const angle = Math.atan2(mouse.y - baseY, mouse.x - baseX);
+      // preview trajectory little dots
+      let px = baseX + Math.cos(angle)*28, py = baseY + Math.sin(angle)*28;
+      let pvx = Math.cos(angle)*12, pvy = Math.sin(angle)*12;
+      for(let i=0;i<18;i++){
+        ctx.beginPath();
+        ctx.fillStyle = i%2? '#9fb0c0':'#6be5ff';
+        ctx.globalAlpha = 0.8 - i*0.04;
+        ctx.arc(px, py, 3, 0, Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        pvx *= 0.985; pvy *= 0.995; pvy += gravity*0.8;
+        px += pvx; py += pvy;
+      }
+    }
+
+    // draw ball
+    if(ball){
+      ctx.beginPath();
+      ctx.fillStyle = '#ffffff';
+      ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+      ctx.fill();
+      // little shine
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.arc(ball.x - 3, ball.y - 3, 3, 0, Math.PI*2);
+      ctx.fill();
+    } else {
+      // idle ball at launcher
+      ctx.beginPath();
+      ctx.fillStyle = '#ffffff';
+      ctx.arc(W/2, H-36, ballRadius, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // HUD / crosshair
+    ctx.beginPath();
+    ctx.strokeStyle = 'rgba(155,200,240,0.16)';
+    ctx.lineWidth = 1;
+    ctx.moveTo(mouse.x-12, mouse.y); ctx.lineTo(mouse.x+12, mouse.y);
+    ctx.moveTo(mouse.x, mouse.y-12); ctx.lineTo(mouse.x, mouse.y+12);
+    ctx.stroke();
+
+    // top text
+    ctx.fillStyle = '#9fb0c0';
+    ctx.font = '14px Inter, Arial';
+    ctx.fillText('Peggly — mini Peggle vibes', 12, 22);
+  }
+
+  // main loop
+  function loop(ts){
+    const dt = (ts - lastTime) / (1000/60);
+    lastTime = ts;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // controls
+  canvas.addEventListener('mousemove', (e)=>{
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - rect.left;
+    mouse.y = e.clientY - rect.top;
+  });
+  canvas.addEventListener('click', (e)=>{
+    if(gameOver) return;
+    if(!aiming) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const angle = Math.atan2(my - (H-36), mx - (W/2));
+    const power = clamp(dist(mx,my,W/2,H-36)/10, 6, 28);
+    if(balls > 0){
+      newBall(angle, power);
+      aiming = false;
+    }
+  });
+
+  window.addEventListener('keydown', (e)=>{
+    if(e.code === 'Space'){
+      e.preventDefault();
+      if(gameOver) return;
+      if(!aiming) return;
+      if(balls > 0){
+        const angle = Math.atan2(mouse.y - (H-36), mouse.x - (W/2));
+        const power = clamp(dist(mouse.x,mouse.y,W/2,H-36)/10, 6, 28);
+        newBall(angle, power);
+        aiming = false;
+      }
+    } else if(e.key.toLowerCase() === 'r'){
+      restart();
+    }
+  });
+
+  restartBtn.addEventListener('click', restart);
+  function restart(){
+    score = 0; balls = 5; level = 1; gameOver = false;
+    scoreEl.textContent = score; ballsEl.textContent = balls; levelEl.textContent = level;
+    makeLevel(1);
+    ball = null; aiming = true;
+  }
+
+  // init
+  makeLevel(level);
+  scoreEl.textContent = score; ballsEl.textContent = balls; levelEl.textContent = level;
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
